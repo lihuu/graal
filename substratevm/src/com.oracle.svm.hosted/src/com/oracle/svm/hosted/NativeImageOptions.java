@@ -118,6 +118,14 @@ public class NativeImageOptions {
     @Option(help = "Print logging information during compilation")//
     public static final HostedOptionKey<Boolean> PrintAOTCompilation = new HostedOptionKey<>(false);
 
+    @Option(help = "Write one line per compiled method with a hash of the compilation result to the " +
+                    "given file, for build-to-build determinism analysis. The file is appended to, so " +
+                    "remove it when a new pair of builds is compared.", type = Debug)//
+    public static final HostedOptionKey<String> DumpCompilationResults = new HostedOptionKey<>("");
+
+    @Option(help = "Directory for the experimental per-method compilation result cache. Empty string disables the cache.", type = Debug)//
+    public static final HostedOptionKey<String> CompilationResultCacheDir = new HostedOptionKey<>("");
+
     @Option(help = "Print class statistics of native image heap")//
     public static final HostedOptionKey<Boolean> PrintHeapHistogram = new HostedOptionKey<>(false);
 

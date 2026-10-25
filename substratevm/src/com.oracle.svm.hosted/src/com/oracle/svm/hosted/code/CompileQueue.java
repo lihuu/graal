@@ -27,13 +27,20 @@ package com.oracle.svm.hosted.code;
 import com.oracle.svm.hosted.RestrictHeapAccessGuestValue;
 import static com.oracle.svm.hosted.code.SubstrateCompilationDirectives.DEOPT_TARGET_METHOD;
 
+import java.io.BufferedWriter;
 import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
 import java.io.PrintWriter;
 import java.lang.annotation.Annotation;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.ListIterator;
 import java.util.Map;
@@ -41,6 +48,8 @@ import java.util.Map.Entry;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
 
 import org.graalvm.collections.EconomicMap;
 import org.graalvm.nativeimage.ImageSingletons;
@@ -83,6 +92,7 @@ import com.oracle.svm.hosted.imagelayer.HostedImageLayerBuildingSupport;
 import com.oracle.svm.hosted.imagelayer.LayeredDispatchTableFeature;
 import com.oracle.svm.hosted.imagelayer.SVMImageLayerLoader;
 import com.oracle.svm.hosted.meta.HostedMethod;
+import com.oracle.svm.hosted.meta.HostedType;
 import com.oracle.svm.hosted.meta.HostedUniverse;
 import com.oracle.svm.hosted.phases.ImageBuildStatisticsCounterPhase;
 import com.oracle.svm.hosted.phases.ImplicitAssertionsPhase;
@@ -90,6 +100,7 @@ import com.oracle.svm.hosted.phases.OOMEExceptionEdgePolicy;
 import com.oracle.svm.hosted.phases.priorityinline.SubstratePriorityInliningPhase;
 import com.oracle.svm.shared.option.HostedOptionValues;
 import com.oracle.svm.shared.option.SubstrateOptionsParser;
+import com.oracle.svm.shared.util.ClassUtil;
 import com.oracle.svm.shared.util.LogUtils;
 import com.oracle.svm.shared.util.VMError;
 import com.oracle.svm.util.GuestAccess;
@@ -168,6 +179,7 @@ import jdk.vm.ci.code.Register;
 import jdk.vm.ci.code.site.Call;
 import jdk.vm.ci.code.site.ConstantReference;
 import jdk.vm.ci.code.site.DataPatch;
+import jdk.vm.ci.code.site.ExceptionHandler;
 import jdk.vm.ci.code.site.Infopoint;
 import jdk.vm.ci.meta.MetaAccessProvider;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
@@ -220,6 +232,13 @@ public class CompileQueue {
     private volatile boolean inliningProgress;
 
     private final boolean printMethodHistogram = NativeImageOptions.PrintMethodHistogram.getValue();
+    private final String dumpCompilationResultsPath = NativeImageOptions.DumpCompilationResults.getValue();
+    private PrintWriter compilationResultDumpWriter;
+    private final String compilationResultCacheDir = NativeImageOptions.CompilationResultCacheDir.getValue();
+    private final java.util.concurrent.ConcurrentLinkedQueue<PendingStore> pendingStores = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    private final AtomicLong cacheHits = new AtomicLong();
+    private final AtomicLong cacheMisses = new AtomicLong();
+    private final AtomicLong cacheStores = new AtomicLong();
     private final boolean optionAOTTrivialInline = SubstrateOptions.AOTTrivialInline.getValue();
     private final boolean allowFoldMethods = NativeImageOptions.AllowFoldMethods.getValue();
 
@@ -358,7 +377,9 @@ public class CompileQueue {
 
         @Override
         public void run(DebugContext debug) {
+            long startNanos = System.nanoTime();
             result = doCompile(debug, method, compilationIdentifier, reason);
+            dumpCompilationResult(method, result, System.nanoTime() - startNanos);
         }
 
         @Override
@@ -498,6 +519,11 @@ public class CompileQueue {
             metricValues.print(universe.getBigBang().getOptions());
         } catch (InterruptedException ie) {
             throw new InterruptImageBuilding();
+        }
+        if (!compilationResultCacheDir.isEmpty()) {
+            TTY.println(String.format("[CompileQueue] compilation result cache: hits=%d misses=%d stores=%d", cacheHits.get(), cacheMisses.get(), cacheStores.get()));
+            CompilationResultStore.REJECT_STATS.entrySet().stream().sorted((a, b) -> Long.compare(b.getValue().sum(), a.getValue().sum()))
+                            .limit(400).forEach(e -> TTY.println("[CompileQueue] cache reject: " + e.getKey() + " = " + e.getValue().sum()));
         }
         if (printMethodHistogram) {
             printMethodHistogram();
@@ -646,6 +672,186 @@ public class CompileQueue {
 
     public Collection<CompileTask> getCompilationTasks() {
         return compilations.values();
+    }
+
+    /**
+     * Appends one line per compiled method to the file given by
+     * {@link NativeImageOptions#DumpCompilationResults}, so that the compilation results of two
+     * builds can be compared method by method. Only data that is stable across builder JVM
+     * processes is included, i.e., no identity hash codes and no object addresses.
+     */
+    private void dumpCompilationResult(HostedMethod method, CompilationResult result, long durationNanos) {
+        if (dumpCompilationResultsPath.isEmpty()) {
+            return;
+        }
+        PrintWriter writer = compilationResultDumpWriter();
+        if (writer == null) {
+            return;
+        }
+
+        MessageDigest digest;
+        try {
+            digest = MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException ex) {
+            throw VMError.shouldNotReachHere(ex);
+        }
+        digest.update(result.getTargetCode(), 0, result.getTargetCodeSize());
+        StringBuilder metadata = new StringBuilder();
+        if (!codeOnlyCompilationResultHash()) {
+            for (Infopoint infopoint : result.getInfopoints()) {
+                metadata.append(infopoint.pcOffset).append(';');
+                if (infopoint instanceof Call call) {
+                    metadata.append('c').append(call.direct).append(';');
+                    if (call.target != null) {
+                        metadata.append(((ResolvedJavaMethod) call.target).format("%H.%n(%p)")).append(';');
+                    }
+                }
+            }
+            for (ExceptionHandler handler : result.getExceptionHandlers()) {
+                metadata.append(handler.pcOffset).append(',').append(handler.handlerPos).append(';');
+            }
+            for (DataPatch dataPatch : result.getDataPatches()) {
+                metadata.append(dataPatch.pcOffset).append(',').append(ClassUtil.getUnqualifiedName(dataPatch.reference.getClass())).append(';');
+            }
+        }
+        digest.update(metadata.toString().getBytes(StandardCharsets.UTF_8));
+
+        StringBuilder line = new StringBuilder();
+        line.append(HexFormat.of().formatHex(digest.digest()));
+        line.append(' ').append(result.getTargetCodeSize());
+        line.append(' ').append(result.getInfopoints().size());
+        line.append(' ').append(result.getDataPatches().size());
+        line.append(' ').append(result.getExceptionHandlers().size());
+        line.append(' ').append(durationNanos / 1000); // microseconds, for cache-tier analysis
+        line.append(' ').append(method.format("%H.%n(%p) %r"));
+        if (method.isDeoptTarget()) {
+            line.append(" [deopt-target]");
+        }
+
+        synchronized (writer) {
+            writer.println(line);
+            writer.flush();
+        }
+    }
+
+    /**
+     * Diagnostic switch for determinism analysis: when set, only the machine code bytes enter the
+     * per-method hash, which separates "code bytes differ" from "metadata differ".
+     */
+    private static boolean codeOnlyCompilationResultHash() {
+        return Boolean.getBoolean("svm.dumpCompilationResults.codeOnly");
+    }
+
+    /**
+     * Fingerprint of everything that determines the compilation result of a method. The raw
+     * bytecode is used instead of the encoded graph because {@link EncodedGraph#getEncoding()} is
+     * not stable across builds (encoding order varies), while the bytecode of a method is. For the
+     * zero-infopoint/zero-datapatch methods this cache covers, the bytecode fully determines the
+     * compilation input: those methods have no invokes (hence no inlining closure) and no embedded
+     * constants. Returns null for methods without bytecode, which are not cached.
+     */
+    private String compilationFingerprint(HostedMethod method) {
+        byte[] code = method.getCode();
+        if (code == null) {
+            return null;
+        }
+        MessageDigest digest;
+        try {
+            digest = MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException ex) {
+            throw VMError.shouldNotReachHere(ex);
+        }
+        digest.update(code);
+        digest.update((method.format("%H.%n(%p) %r") + (method.isDeoptTarget() ? "|deoptTarget" : "")).getBytes(StandardCharsets.UTF_8));
+        String environment = "v1|O=" + SubstrateOptions.optimizationLevel() +
+                        "|trivialInline=" + SubstrateOptions.AOTTrivialInline.getValue() +
+                        "|prioInline=" + SubstrateOptions.AOTPriorityInline.getValue() +
+                        "|arch=" + SubstrateTarget.getArchitecture() +
+                        "|deopt=" + com.oracle.svm.core.deopt.DeoptimizationSupport.enabled() +
+                        "|graal=25.4.4.1.1-poc3";
+        digest.update(environment.getBytes(StandardCharsets.UTF_8));
+        return HexFormat.of().formatHex(digest.digest());
+    }
+
+    private record PendingStore(HostedMethod method, String fingerprint, CompilationResult result) {
+    }
+
+    /** Called after the image heap was built, when constant field values are materialized. */
+    public void storePendingEntries() {
+        if (compilationResultCacheDir.isEmpty()) {
+            return;
+        }
+        PendingStore pending;
+        while ((pending = pendingStores.poll()) != null) {
+            if (CompilationResultStore.store(pending.method(), pending.result(), pending.fingerprint(), compilationResultCacheDir)) {
+                cacheStores.incrementAndGet();
+            }
+        }
+    }
+
+    /** Stable key used by the compilation result cache to reference methods across builds. */
+    static String methodCacheKey(HostedMethod method) {
+        return method.format("%H.%n(%p) %r") + (method.isDeoptTarget() ? "|deoptTarget" : "");
+    }
+
+    private ConcurrentHashMap<String, HostedMethod> methodKeyLookup;
+    private ConcurrentHashMap<String, com.oracle.graal.pointsto.meta.AnalysisType> imageTypeLookup;
+
+    private Function<String, com.oracle.graal.pointsto.meta.AnalysisType> imageTypeResolver() {
+        ConcurrentHashMap<String, com.oracle.graal.pointsto.meta.AnalysisType> lookup = imageTypeLookup;
+        if (lookup == null) {
+            synchronized (this) {
+                if (imageTypeLookup == null) {
+                    lookup = new ConcurrentHashMap<>();
+                    for (HostedType hostedType : universe.getTypes()) {
+                        lookup.put(hostedType.getWrapped().getName(), hostedType.getWrapped());
+                    }
+                    imageTypeLookup = lookup;
+                } else {
+                    lookup = imageTypeLookup;
+                }
+            }
+        }
+        return lookup::get;
+    }
+
+    private Function<String, HostedMethod> methodKeyResolver() {
+        ConcurrentHashMap<String, HostedMethod> lookup = methodKeyLookup;
+        if (lookup == null) {
+            synchronized (this) {
+                if (methodKeyLookup == null) {
+                    lookup = new ConcurrentHashMap<>();
+                    for (HostedMethod original : universe.getMethods()) {
+                        for (MethodVariant variant : original.getAllMethodVariants()) {
+                            HostedMethod hMethod = (HostedMethod) variant;
+                            HostedMethod previous = lookup.putIfAbsent(methodCacheKey(hMethod), hMethod);
+                            assert previous == null : "ambiguous cache method key " + methodCacheKey(hMethod);
+                        }
+                    }
+                    methodKeyLookup = lookup;
+                } else {
+                    lookup = methodKeyLookup;
+                }
+            }
+        }
+        return lookup::get;
+    }
+
+    private PrintWriter compilationResultDumpWriter() {
+        PrintWriter writer = compilationResultDumpWriter;
+        if (writer == null) {
+            synchronized (this) {
+                if (compilationResultDumpWriter == null) {
+                    try {
+                        compilationResultDumpWriter = new PrintWriter(new BufferedWriter(new FileWriter(dumpCompilationResultsPath, true)));
+                    } catch (IOException ex) {
+                        throw VMError.shouldNotReachHere("Cannot open compilation result dump file " + dumpCompilationResultsPath, ex);
+                    }
+                }
+                writer = compilationResultDumpWriter;
+            }
+        }
+        return writer;
     }
 
     private void printMethodHistogram() {
@@ -1497,8 +1703,30 @@ public class CompileQueue {
         if (customFunction != null) {
             return customFunction.compile(debug, method, compilationIdentifier, reason, runtimeConfig);
         }
+        String fingerprint = null;
+        if (!compilationResultCacheDir.isEmpty()) {
+            fingerprint = compilationFingerprint(method);
+            if (fingerprint != null) {
+                CompilationResult cached = CompilationResultStore.tryLoad(method, compilationIdentifier, fingerprint, compilationResultCacheDir, methodKeyResolver(), imageTypeResolver());
+                if (cached != null) {
+                    cacheHits.incrementAndGet();
+                    /* A cache hit must propagate callee compilations like a regular compilation does. */
+                    ensureCalleesCompiled(method, reason, cached);
+                    return cached;
+                }
+                cacheMisses.incrementAndGet();
+            }
+        }
         try {
-            return defaultCompileFunction(debug, method, compilationIdentifier, reason, runtimeConfig, false);
+            CompilationResult result = defaultCompileFunction(debug, method, compilationIdentifier, reason, runtimeConfig, false);
+            if (fingerprint != null && CompilationResultStore.isCacheable(result)) {
+                /*
+                 * Image heap constants are not materialized until the heap is built, so storing is
+                 * deferred to storePendingEntries() after buildNativeImageHeap.
+                 */
+                pendingStores.add(new PendingStore(method, fingerprint, result));
+            }
+            return result;
         } catch (RuntimeException | Error t) {
             if (fallbackCompilation) {
                 // print a warning and fall back

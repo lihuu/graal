@@ -794,6 +794,9 @@ public class NativeImageGenerator {
                         verifyAndSealShadowHeap(codeCache, debug, heap);
 
                         ImageHeapLayoutInfo heapLayout = buildNativeImageHeap(heap, codeCache);
+                        if (compileQueue != null) {
+                            compileQueue.storePendingEntries();
+                        }
                         BuildPhaseProviderImpl.markHeapLayoutFinished();
 
                         AfterHeapLayoutAccessImpl config = new AfterHeapLayoutAccessImpl(featureHandler, loader, heap, heapLayout, hMetaAccess, debug);

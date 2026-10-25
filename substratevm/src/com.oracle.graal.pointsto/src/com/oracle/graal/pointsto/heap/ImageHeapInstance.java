@@ -101,6 +101,23 @@ public final class ImageHeapInstance extends ImageHeapConstant {
         return (InstanceData) super.getConstantData();
     }
 
+    /**
+     * Used by {@code com.oracle.svm.hosted.code.CompilationResultStore} to serialize field values
+     * for the experimental cross-build compilation result cache.
+     */
+    public Object[] hostedFieldValues() {
+        ConstantData data = getConstantData();
+        return data instanceof InstanceData instanceData ? instanceData.fieldValues : null;
+    }
+
+    /**
+     * Used by {@code com.oracle.svm.hosted.code.CompilationResultStore}: unlike
+     * {@link #setFieldValues}, this overwrites any pre-initialized values of a detached constant.
+     */
+    public void forceSetFieldValues(Object[] fieldValues) {
+        valuesHandle.set(constantData, canonicalizeFieldValues(fieldValues));
+    }
+
     public void setFieldValues(Object[] fieldValues) {
         boolean success = valuesHandle.compareAndSet(constantData, null, canonicalizeFieldValues(fieldValues));
         AnalysisError.guarantee(success, "Unexpected field values reference for constant %s", this);

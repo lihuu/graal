@@ -62,6 +62,30 @@ import jdk.vm.ci.meta.VMConstant;
 @AutomaticallyRegisteredFeature
 @Platforms({Platform.AARCH64.class})
 public class AArch64HostedPatcherFeature implements InternalFeature {
+
+    /**
+     * Used by {@link com.oracle.svm.hosted.code.CompilationResultStore} to serialize the patch
+     * description of a direct B/BL call site for the experimental cross-build compilation result
+     * cache. Returns null for any other kind of annotation.
+     */
+    public static SingleInstructionAnnotation extractSingleInstruction(CompilationResult.CodeAnnotation annotation) {
+        if (annotation instanceof SingleInstructionHostedPatcher patcher) {
+            return patcher.annotation;
+        }
+        return null;
+    }
+
+    /**
+     * Used by {@link com.oracle.svm.hosted.code.CompilationResultStore} to serialize and rebuild
+     * mov-sequence patchers for the experimental cross-build compilation result cache.
+     */
+    public static AArch64MacroAssembler.MovSequenceAnnotation extractMovSequence(CompilationResult.CodeAnnotation annotation) {
+        if (annotation instanceof MovSequenceHostedPatcher patcher) {
+            return patcher.annotation;
+        }
+        return null;
+    }
+
     @Override
     public void afterRegistration(AfterRegistrationAccess access) {
         ImageSingletons.add(PatchConsumerFactory.HostedPatchConsumerFactory.class, new AArch64HostedPatchConsumerFactory());
@@ -97,7 +121,7 @@ public class AArch64HostedPatcherFeature implements InternalFeature {
 }
 
 class SingleInstructionHostedPatcher extends CompilationResult.CodeAnnotation implements HostedPatcher {
-    private final SingleInstructionAnnotation annotation;
+    final SingleInstructionAnnotation annotation;
 
     SingleInstructionHostedPatcher(SingleInstructionAnnotation annotation) {
         super(annotation.instructionPosition);
@@ -289,7 +313,7 @@ class AArch64HostedCGlobalDataIndirectReferencePatcher extends CompilationResult
 }
 
 class MovSequenceHostedPatcher extends CompilationResult.CodeAnnotation implements HostedPatcher {
-    private final AArch64MacroAssembler.MovSequenceAnnotation annotation;
+    final AArch64MacroAssembler.MovSequenceAnnotation annotation;
 
     MovSequenceHostedPatcher(AArch64MacroAssembler.MovSequenceAnnotation annotation) {
         super(annotation.instructionPosition);

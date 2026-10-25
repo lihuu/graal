@@ -102,6 +102,15 @@ public final class ImageHeapObjectArray extends ImageHeapArray {
         return (ObjectArrayData) super.getConstantData();
     }
 
+    /**
+     * Used by {@code com.oracle.svm.hosted.code.CompilationResultStore}: unlike
+     * {@link #setElementValues}, this overwrites any pre-initialized elements of a detached
+     * constant.
+     */
+    public void forceSetElementValues(Object[] elementValues) {
+        elementsHandle.set(constantData, canonicalizeElementValues(elementValues));
+    }
+
     public void setElementValues(Object[] elementValues) {
         boolean success = elementsHandle.compareAndSet(constantData, null, canonicalizeElementValues(elementValues));
         AnalysisError.guarantee(success, "Unexpected field values reference for constant %s", this);
