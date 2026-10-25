@@ -276,11 +276,23 @@ final class CompilationResultStore {
         }
     }
 
-    private static Class<?> classForName(String name) throws IOException {
+    private static Class<?> classForName(String internalName) throws IOException {
+        String name = internalName;
+        if (name.startsWith("L") && name.endsWith(";")) {
+            /* AnalysisType.getName() uses the JVM internal form Lcom/pkg/Cls;. */
+            name = name.substring(1, name.length() - 1);
+        }
+        name = name.replace('/', '.');
         try {
-            return Class.forName(name, true, Thread.currentThread().getContextClassLoader());
+            Class<?> cls = Class.forName(name, true, Thread.currentThread().getContextClassLoader());
+            return cls;
         } catch (ClassNotFoundException ex) {
-            throw new IOException("cannot load class " + name, ex);
+            try {
+                /* SVM runtime classes live on the builder module path, not the app class loader. */
+                return Class.forName(name, true, CompilationResultStore.class.getClassLoader());
+            } catch (ClassNotFoundException ex2) {
+                throw new IOException("cannot load class " + internalName, ex2);
+            }
         }
     }
 
@@ -382,8 +394,8 @@ final class CompilationResultStore {
 
     /** Reflective sun.misc.Unsafe access: no compile-time dependency on the unexported package. */
     private static final class UnsafeProxy {
-        static final Object UNSAFE = unsafeInstance();
         static final Class<?> CLS = unsafeClass();
+        static final Object UNSAFE = unsafeInstance();
         static final java.lang.reflect.Method ALLOCATE = method("allocateInstance", Class.class);
         static final java.lang.reflect.Method OFFSET = method("objectFieldOffset", java.lang.reflect.Field.class);
         static final java.lang.reflect.Method PUT_OBJ = method("putObject", Object.class, long.class, Object.class);
