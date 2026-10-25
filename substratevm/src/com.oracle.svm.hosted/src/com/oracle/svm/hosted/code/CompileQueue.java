@@ -235,6 +235,7 @@ public class CompileQueue {
     private final String dumpCompilationResultsPath = NativeImageOptions.DumpCompilationResults.getValue();
     private PrintWriter compilationResultDumpWriter;
     private final String compilationResultCacheDir = NativeImageOptions.CompilationResultCacheDir.getValue();
+    private final boolean conservativeCacheMode = "conservative".equals(NativeImageOptions.CompilationResultCacheMode.getValue());
     private final java.util.concurrent.ConcurrentLinkedQueue<PendingStore> pendingStores = new java.util.concurrent.ConcurrentLinkedQueue<>();
     private final AtomicLong cacheHits = new AtomicLong();
     private final AtomicLong cacheMisses = new AtomicLong();
@@ -768,6 +769,7 @@ public class CompileQueue {
                         "|prioInline=" + SubstrateOptions.AOTPriorityInline.getValue() +
                         "|arch=" + SubstrateTarget.getArchitecture() +
                         "|deopt=" + com.oracle.svm.core.deopt.DeoptimizationSupport.enabled() +
+                        "|mode=" + (conservativeCacheMode ? "conservative" : "full") +
                         "|graal=25.4.4.1.1-poc3";
         digest.update(environment.getBytes(StandardCharsets.UTF_8));
         return HexFormat.of().formatHex(digest.digest());
@@ -1719,7 +1721,7 @@ public class CompileQueue {
         }
         try {
             CompilationResult result = defaultCompileFunction(debug, method, compilationIdentifier, reason, runtimeConfig, false);
-            if (fingerprint != null && CompilationResultStore.isCacheable(result)) {
+            if (fingerprint != null && CompilationResultStore.isCacheable(result, conservativeCacheMode)) {
                 /*
                  * Image heap constants are not materialized until the heap is built, so storing is
                  * deferred to storePendingEntries() after buildNativeImageHeap.

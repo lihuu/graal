@@ -126,6 +126,9 @@ public class NativeImageOptions {
     @Option(help = "Directory for the experimental per-method compilation result cache. Empty string disables the cache.", type = Debug)//
     public static final HostedOptionKey<String> CompilationResultCacheDir = new HostedOptionKey<>("");
 
+    @Option(help = "Cache mode: 'full' includes methods with image heap constants (mov-sequence and heap-constant patchers); 'conservative' caches only methods without data patches (v6 semantics).", type = Debug)//
+    public static final HostedOptionKey<String> CompilationResultCacheMode = new HostedOptionKey<>("full");
+
     @Option(help = "Print class statistics of native image heap")//
     public static final HostedOptionKey<Boolean> PrintHeapHistogram = new HostedOptionKey<>(false);
 

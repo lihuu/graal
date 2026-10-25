@@ -492,8 +492,12 @@ final class CompilationResultStore {
         return debugInfo;
     }
 
-    static boolean isCacheable(CompilationResult result) {
+    static boolean isCacheable(CompilationResult result, boolean conservative) {
         boolean hasDataPatches = !result.getDataPatches().isEmpty();
+        if (conservative && hasDataPatches) {
+            reject("conservative:dp");
+            return false;
+        }
         if (hasDataPatches) {
             for (DataPatch dataPatch : result.getDataPatches()) {
                 if (!(dataPatch.reference instanceof ConstantReference constantReference) ||
@@ -556,10 +560,10 @@ final class CompilationResultStore {
             if ((SubstrateTarget.getArchitecture() instanceof AArch64) && AArch64HostedPatcherFeature.extractSingleInstruction(annotation) != null) {
                 continue;
             }
-            if (annotation instanceof HostedImageHeapConstantPatch) {
+            if (!conservative && annotation instanceof HostedImageHeapConstantPatch) {
                 continue;
             }
-            if ((SubstrateTarget.getArchitecture() instanceof AArch64) && AArch64HostedPatcherFeature.extractMovSequence(annotation) != null) {
+            if (!conservative && (SubstrateTarget.getArchitecture() instanceof AArch64) && AArch64HostedPatcherFeature.extractMovSequence(annotation) != null) {
                 continue;
             }
             reject((hasDataPatches ? "tlab-annotation:" : "annotation:") + ClassUtil.getUnqualifiedName(annotation.getClass()));
